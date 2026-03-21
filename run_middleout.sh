@@ -10,7 +10,7 @@ if [ ! -d "./data/datasets/fineweb10B_sp1024" ]; then
     echo "Missing ./data/cached_challenge_fineweb.py. Run this inside a full parameter-golf checkout."
     exit 1
   fi
-  if [ "$MODE" = "smoke" ]; then
+  if [ "$MODE" = "smoke" ] || [ "$MODE" = "moonshot" ]; then
     python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 1
   else
     python3 data/cached_challenge_fineweb.py --variant sp1024
@@ -63,8 +63,53 @@ case "$MODE" in
     NGRAM_HASH_DIM=64 \
     torchrun --standalone --nproc_per_node="$NGPU" train_gpt_recurrent.py
     ;;
+  moonshot)
+    RUN_ID=middleout_moonshot \
+    DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+    TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+    VOCAB_SIZE=1024 \
+    ITERATIONS=200 \
+    TRAIN_BATCH_TOKENS=8192 \
+    TRAIN_LOG_EVERY=20 \
+    VAL_LOSS_EVERY=0 \
+    VAL_BATCH_SIZE=524288 \
+    DEPTH_RECURRENCE=1 \
+    NUM_LAYERS=12 \
+    MODEL_DIM=1024 \
+    NUM_HEADS=16 \
+    NUM_KV_HEADS=4 \
+    MLP_MULT=3 \
+    PREV_TOKEN_SMEAR=1 \
+    BIGRAM_HASH_BUCKETS=8192 \
+    TRIGRAM_HASH_BUCKETS=16384 \
+    NGRAM_HASH_DIM=128 \
+    python3 train_gpt_recurrent.py
+    ;;
+  moonshot-full)
+    NCCL_IB_DISABLE=1 \
+    RUN_ID=middleout_moonshot_full \
+    DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+    TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+    VOCAB_SIZE=1024 \
+    MAX_WALLCLOCK_SECONDS=600 \
+    TRAIN_BATCH_TOKENS=524288 \
+    TRAIN_LOG_EVERY=50 \
+    VAL_LOSS_EVERY=200 \
+    VAL_BATCH_SIZE=524288 \
+    DEPTH_RECURRENCE=1 \
+    NUM_LAYERS=12 \
+    MODEL_DIM=1024 \
+    NUM_HEADS=16 \
+    NUM_KV_HEADS=4 \
+    MLP_MULT=3 \
+    PREV_TOKEN_SMEAR=1 \
+    BIGRAM_HASH_BUCKETS=8192 \
+    TRIGRAM_HASH_BUCKETS=16384 \
+    NGRAM_HASH_DIM=128 \
+    torchrun --standalone --nproc_per_node="$NGPU" train_gpt_recurrent.py
+    ;;
   *)
-    echo "Usage: $0 [smoke|full] [num_gpus]"
+    echo "Usage: $0 [smoke|full|moonshot|moonshot-full] [num_gpus]"
     exit 1
     ;;
 esac
