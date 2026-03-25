@@ -48,6 +48,82 @@ case "$MODE" in
     HADAMARD_EXPORT_CHUNK=512 \
     python3 train_gpt_turboquant_export.py
     ;;
+  control)
+    RUN_ID=turboquant_export_control \
+    DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+    TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+    VOCAB_SIZE=1024 \
+    NUM_LAYERS=11 \
+    BIGRAM_VOCAB_SIZE=1536 \
+    XSA_LAST_N=4 \
+    SWA_ENABLED=1 \
+    SWA_EVERY=50 \
+    ROPE_DIMS=16 \
+    LN_SCALE=1 \
+    LATE_QAT_THRESHOLD=0.15 \
+    VE_ENABLED=1 \
+    VE_DIM=128 \
+    VE_LAYERS=9,10 \
+    TTT_ENABLED=0 \
+    MUON_WD=0.04 \
+    ADAM_WD=0.04 \
+    MATRIX_LR=0.025 \
+    SCALAR_LR=0.025 \
+    TIED_EMBED_LR=0.035 \
+    MUON_MOMENTUM=0.99 \
+    MUON_MOMENTUM_WARMUP_START=0.92 \
+    MUON_MOMENTUM_WARMUP_STEPS=1500 \
+    WARMDOWN_ITERS=3500 \
+    ITERATIONS=200 \
+    TRAIN_BATCH_TOKENS=8192 \
+    TRAIN_SEQ_LEN=1024 \
+    EVAL_SEQ_LEN=1024 \
+    VAL_BATCH_SIZE=524288 \
+    VAL_LOSS_EVERY=0 \
+    TRAIN_LOG_EVERY=20 \
+    EVAL_STRIDE=0 \
+    HADAMARD_EXPORT_ENABLED=0 \
+    HADAMARD_EXPORT_CHUNK=512 \
+    python3 train_gpt_turboquant_export.py
+    ;;
+  chunk64)
+    RUN_ID=turboquant_export_chunk64 \
+    DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+    TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+    VOCAB_SIZE=1024 \
+    NUM_LAYERS=11 \
+    BIGRAM_VOCAB_SIZE=1536 \
+    XSA_LAST_N=4 \
+    SWA_ENABLED=1 \
+    SWA_EVERY=50 \
+    ROPE_DIMS=16 \
+    LN_SCALE=1 \
+    LATE_QAT_THRESHOLD=0.15 \
+    VE_ENABLED=1 \
+    VE_DIM=128 \
+    VE_LAYERS=9,10 \
+    TTT_ENABLED=0 \
+    MUON_WD=0.04 \
+    ADAM_WD=0.04 \
+    MATRIX_LR=0.025 \
+    SCALAR_LR=0.025 \
+    TIED_EMBED_LR=0.035 \
+    MUON_MOMENTUM=0.99 \
+    MUON_MOMENTUM_WARMUP_START=0.92 \
+    MUON_MOMENTUM_WARMUP_STEPS=1500 \
+    WARMDOWN_ITERS=3500 \
+    ITERATIONS=200 \
+    TRAIN_BATCH_TOKENS=8192 \
+    TRAIN_SEQ_LEN=1024 \
+    EVAL_SEQ_LEN=1024 \
+    VAL_BATCH_SIZE=524288 \
+    VAL_LOSS_EVERY=0 \
+    TRAIN_LOG_EVERY=20 \
+    EVAL_STRIDE=0 \
+    HADAMARD_EXPORT_ENABLED=1 \
+    HADAMARD_EXPORT_CHUNK=64 \
+    python3 train_gpt_turboquant_export.py
+    ;;
   full)
     if [ ! -f "./data/datasets/fineweb10B_sp1024/fineweb_train_000079.bin" ]; then
       python3 data/cached_challenge_fineweb.py --variant sp1024
@@ -93,7 +169,7 @@ case "$MODE" in
     torchrun --standalone --nproc_per_node="$NGPU" train_gpt_turboquant_export.py
     ;;
   *)
-    echo "Usage: $0 [smoke|full] [num_gpus]"
+    echo "Usage: $0 [smoke|control|chunk64|full] [num_gpus]"
     exit 1
     ;;
 esac
