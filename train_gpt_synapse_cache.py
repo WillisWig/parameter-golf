@@ -385,7 +385,6 @@ def eval_val_synapse_cache(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     cache = torch.zeros((args.synapse_cache_buckets, args.vocab_size), device=device, dtype=torch.float16)
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-    sentinel = torch.full((1,), args.vocab_size, device=device, dtype=torch.int64)
     base_model.eval()
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, batch_seqs):
@@ -398,20 +397,21 @@ def eval_val_synapse_cache(
             bsz = x.size(0)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = compiled_logits(x)
-            prev_prev = sentinel.expand(bsz)
-            for t in range(seq_len):
-                prev = x[:, t]
-                buckets = ((prev_prev + 1) * 1009 + (prev + 1) * 9176 + 1) % args.synapse_cache_buckets
-                prior = cache.index_select(0, buckets).float()
-                adjusted_logits = logits[:, t, :].float() + args.synapse_cache_scale * torch.log1p(prior)
-                tgt = y[:, t]
-                val_loss_sum += F.cross_entropy(adjusted_logits, tgt, reduction="sum").to(torch.float64)
-                val_token_count += float(bsz)
-                token_bytes = base_bytes_lut[tgt].to(dtype=torch.int16)
-                token_bytes += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(dtype=torch.int16)
-                val_byte_count += token_bytes.to(torch.float64).sum()
-                cache.index_put_((buckets, tgt), torch.ones_like(tgt, dtype=cache.dtype), accumulate=True)
-                prev_prev = prev
+            loss_add, tok_add, byte_add = apply_synapse_cache_scored_batch(
+                args,
+                cache,
+                logits,
+                x,
+                y,
+                [seq_len] * bsz,
+                [0] * bsz,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            val_loss_sum += loss_add
+            val_token_count += tok_add
+            val_byte_count += byte_add
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
@@ -421,6 +421,48 @@ def eval_val_synapse_cache(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def apply_synapse_cache_scored_batch(
+    args: Hyperparameters,
+    cache: Tensor,
+    logits: Tensor,
+    x_batch: Tensor,
+    y_batch: Tensor,
+    wlens: list[int],
+    score_starts: list[int],
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    device = logits.device
+    bsz, seq_len = x_batch.shape
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    prev_prev = torch.full((bsz,), args.vocab_size, device=device, dtype=torch.int64)
+    wlen_t = torch.tensor(wlens, device=device, dtype=torch.int64)
+    start_t = torch.tensor(score_starts, device=device, dtype=torch.int64)
+    for t in range(seq_len):
+        prev = x_batch[:, t]
+        tgt = y_batch[:, t]
+        score_mask = (t < wlen_t) & (t >= start_t)
+        if torch.any(score_mask):
+            buckets = ((prev_prev[score_mask] + 1) * 1009 + (prev[score_mask] + 1) * 9176 + 1) % args.synapse_cache_buckets
+            prior = cache.index_select(0, buckets).float()
+            adjusted_logits = logits[score_mask, t, :].float() + args.synapse_cache_scale * torch.log1p(prior)
+            tgt_scored = tgt[score_mask]
+            prev_scored = prev[score_mask]
+            loss_sum += F.cross_entropy(adjusted_logits, tgt_scored, reduction="sum").to(torch.float64)
+            token_count += float(tgt_scored.numel())
+            token_bytes = base_bytes_lut[tgt_scored].to(dtype=torch.int16)
+            token_bytes += (
+                has_leading_space_lut[tgt_scored] & ~is_boundary_token_lut[prev_scored]
+            ).to(dtype=torch.int16)
+            byte_count += token_bytes.to(torch.float64).sum()
+            cache.index_put_((buckets, tgt_scored), torch.ones_like(tgt_scored, dtype=cache.dtype), accumulate=True)
+        prev_prev = prev
+    return loss_sum, token_count, byte_count
 
 # --- Quantization helpers ---
 
@@ -1092,6 +1134,11 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    cache = (
+        torch.zeros((args.synapse_cache_buckets, args.vocab_size), device=device, dtype=torch.float16)
+        if args.synapse_cache_enabled
+        else None
+    )
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1108,22 +1155,40 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
+            score_starts = [0 if ws == 0 else max(wlens[i] - stride, 0) for i, ws in enumerate(batch_ws)]
+            if cache is not None:
+                loss_add, tok_add, byte_add = apply_synapse_cache_scored_batch(
+                    args,
+                    cache,
+                    logits,
+                    x_batch,
+                    y_batch,
+                    wlens,
+                    score_starts,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                loss_sum += loss_add
+                token_count += tok_add
+                byte_count += byte_add
+            else:
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = score_starts[i]
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1170,6 +1235,11 @@ def eval_val_sliding_ttt(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    cache = (
+        torch.zeros((args.synapse_cache_buckets, args.vocab_size), device=device, dtype=torch.float16)
+        if args.synapse_cache_enabled
+        else None
+    )
 
     # Freeze first N blocks
     frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
@@ -1221,20 +1291,38 @@ def eval_val_sliding_ttt(
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x_batch)
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
-                for i, ws in enumerate(batch_ws):
-                    wlen = wlens[i]
-                    s = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_nll = nll[i, s:wlen].to(torch.float64)
-                    loss_sum += scored_nll.sum()
-                    token_count += float(wlen - s)
-                    tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
-                    tb = base_bytes_lut[tgt].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                    byte_count += tb.sum()
+                score_starts = [0 if ws == 0 else max(wlens[i] - stride, 0) for i, ws in enumerate(batch_ws)]
+                if cache is not None:
+                    loss_add, tok_add, byte_add = apply_synapse_cache_scored_batch(
+                        args,
+                        cache,
+                        logits,
+                        x_batch,
+                        y_batch,
+                        wlens,
+                        score_starts,
+                        base_bytes_lut,
+                        has_leading_space_lut,
+                        is_boundary_token_lut,
+                    )
+                    loss_sum += loss_add
+                    token_count += tok_add
+                    byte_count += byte_add
+                else:
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        y_batch.reshape(-1), reduction="none",
+                    ).reshape(bsz, seq_len)
+                    for i, ws in enumerate(batch_ws):
+                        wlen = wlens[i]
+                        s = score_starts[i]
+                        scored_nll = nll[i, s:wlen].to(torch.float64)
+                        loss_sum += scored_nll.sum()
+                        token_count += float(wlen - s)
+                        tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
+                        tb = base_bytes_lut[tgt].to(torch.float64)
+                        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                        byte_count += tb.sum()
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
